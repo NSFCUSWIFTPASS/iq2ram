@@ -178,7 +178,8 @@ void recv_to_file_triggered(
     double gain,
     const std::string& file_desc,
     int skip_first,
-    int start_retries)
+    int start_retries,
+    int capture_count)
 {
     // Create receive streamer
     uhd::stream_args_t stream_args(cpu_format, wire_format);
@@ -237,196 +238,227 @@ void recv_to_file_triggered(
         rx_stream->recv(temp_buf.data(), samps_per_buff, md, 3.0, false);
     }
 
-    std::cout << "\nWaiting for trigger (threshold=" << threshold << ", hyst=" << hyst << ")..." << std::endl;
+    // Determine if infinite mode (count=0)
+    bool infinite_mode = (capture_count == 0);
+    int total_captures = infinite_mode ? 999999 : capture_count;
 
-    bool overflow_message = true;
+    // === CAPTURE LOOP ===
+    for (int capture_num = 1; capture_num <= total_captures && !stop_signal_called; capture_num++) {
+        // Reset state for this capture
+        triggered = false;
+        detection_count = 0;
+        detection_thread_running = true;
+        top_powers.clear();
 
-    // === PRE-TRIGGER PHASE ===
-    while (!stop_signal_called && !triggered) {
-        size_t num_rx_samps = rx_stream->recv(
-            &(*active_buf)[active_buf_idx],
-            std::min(samps_per_buff, detect_samples - active_buf_idx),
-            md, 3.0, false);
+        // Reset pre-trigger buffer state
+        pre_trig_write_idx = 0;
+        pre_trig_full = false;
 
-        if (md.error_code == uhd::rx_metadata_t::ERROR_CODE_TIMEOUT) {
-            std::cout << "Timeout while streaming" << std::endl;
+        // Reset detection buffer state
+        active_buf = &detect_buf_a;
+        process_buf = &detect_buf_b;
+        active_buf_idx = 0;
+        process_count = 0;
+
+        if (infinite_mode) {
+            std::cout << "\n=== Capture " << capture_num << " (infinite mode) ===" << std::endl;
+        } else {
+            std::cout << "\n=== Capture " << capture_num << "/" << capture_count << " ===" << std::endl;
+        }
+        std::cout << "Waiting for trigger (threshold=" << threshold << ", hyst=" << hyst << ")..." << std::endl;
+
+        // Start detection thread for this capture
+        std::thread detector(detection_thread_fn<samp_type>,
+                            process_buf, &process_count, threshold, hyst);
+
+        bool overflow_message = true;
+
+        // === PRE-TRIGGER PHASE ===
+        while (!stop_signal_called && !triggered) {
+            size_t num_rx_samps = rx_stream->recv(
+                &(*active_buf)[active_buf_idx],
+                std::min(samps_per_buff, detect_samples - active_buf_idx),
+                md, 3.0, false);
+
+            if (md.error_code == uhd::rx_metadata_t::ERROR_CODE_TIMEOUT) {
+                std::cout << "Timeout while streaming" << std::endl;
+                break;
+            }
+            if (md.error_code == uhd::rx_metadata_t::ERROR_CODE_OVERFLOW) {
+                if (overflow_message) {
+                    overflow_message = false;
+                    std::cerr << "Overflow during detection phase" << std::endl;
+                }
+                continue;
+            }
+            if (md.error_code != uhd::rx_metadata_t::ERROR_CODE_NONE) {
+                if (continue_on_bad_packet) continue;
+                else throw std::runtime_error(md.strerror());
+            }
+
+            // Copy to circular pre-trigger buffer using bulk memcpy
+            const samp_type* src = &(*active_buf)[active_buf_idx];
+            size_t remaining = num_rx_samps;
+            while (remaining > 0) {
+                size_t space_to_end = pre_trig_samples - pre_trig_write_idx;
+                size_t to_copy = std::min(remaining, space_to_end);
+                std::memcpy(&pre_trig_buffer[pre_trig_write_idx], src, to_copy * sizeof(samp_type));
+                src += to_copy;
+                remaining -= to_copy;
+                pre_trig_write_idx += to_copy;
+                if (pre_trig_write_idx >= pre_trig_samples) {
+                    pre_trig_write_idx = 0;
+                    pre_trig_full = true;
+                }
+            }
+
+            active_buf_idx += num_rx_samps;
+
+            // Detection buffer full - swap and signal detection thread
+            if (active_buf_idx >= detect_samples) {
+                {
+                    std::lock_guard<std::mutex> lock(buf_mutex);
+                    std::swap(active_buf, process_buf);
+                    process_count = detect_samples;
+                }
+                buf_ready.notify_one();
+                active_buf_idx = 0;
+            }
+        }
+
+        // Stop detection thread
+        detection_thread_running = false;
+        buf_ready.notify_all();
+        detector.join();
+
+        // Print top power readings
+        print_top_powers();
+
+        if (!triggered) {
+            std::cout << "\nStopped without trigger." << std::endl;
+            break;  // Exit capture loop
+        }
+
+        // === POST-TRIGGER PHASE ===
+        // Retry logic at start of recording
+        bool had_overflow = false;
+        int start_attempts = 0;
+        std::string recording_start_time;
+        size_t num_total_samps = 0;
+
+        while (start_attempts < start_retries && !stop_signal_called) {
+            start_attempts++;
+            num_total_samps = 0;
+
+            size_t num_rx_samps = rx_stream->recv(
+                ram_buffer.data(), samps_per_buff, md, 3.0, false);
+
+            if (md.error_code == uhd::rx_metadata_t::ERROR_CODE_OVERFLOW) {
+                std::cout << "Overflow at recording start, retrying (" << start_attempts << "/" << start_retries << ")" << std::endl;
+                continue;
+            }
+
+            // Clean start - capture timestamp now
+            recording_start_time = get_timestamp_ms();
+            num_total_samps = num_rx_samps;
             break;
         }
-        if (md.error_code == uhd::rx_metadata_t::ERROR_CODE_OVERFLOW) {
-            if (overflow_message) {
-                overflow_message = false;
-                std::cerr << "Overflow during detection phase" << std::endl;
+
+        if (start_attempts >= start_retries && num_total_samps == 0) {
+            std::cerr << "Failed to start recording cleanly after " << start_retries << " attempts" << std::endl;
+            break;  // Exit capture loop
+        }
+
+        // Generate filename for this capture (always auto-generate in multi-capture mode)
+        std::string capture_file = file;
+        if (capture_file.empty() && !null) {
+            capture_file = generate_filename(output_dir, hostname, recording_start_time, freq,
+                usrp->get_rx_rate(channel), time_requested, gain, file_desc);
+            std::cout << "Output file: " << capture_file << std::endl;
+        }
+
+        std::cout << "Recording..." << std::endl;
+
+        while (!stop_signal_called && num_total_samps < recording_samples) {
+            size_t remaining = recording_samples - num_total_samps;
+            size_t to_recv = std::min(samps_per_buff, remaining);
+
+            size_t num_rx_samps = rx_stream->recv(
+                &ram_buffer[num_total_samps],
+                to_recv,
+                md, 3.0, false);
+
+            if (md.error_code == uhd::rx_metadata_t::ERROR_CODE_TIMEOUT) break;
+            if (md.error_code == uhd::rx_metadata_t::ERROR_CODE_OVERFLOW) {
+                if (!had_overflow) {
+                    had_overflow = true;
+                    std::cerr << "Overflow during recording!" << std::endl;
+                }
+                continue;
             }
-            continue;
-        }
-        if (md.error_code != uhd::rx_metadata_t::ERROR_CODE_NONE) {
-            if (continue_on_bad_packet) continue;
-            else throw std::runtime_error(md.strerror());
-        }
-
-        // Copy to circular pre-trigger buffer using bulk memcpy
-        const samp_type* src = &(*active_buf)[active_buf_idx];
-        size_t remaining = num_rx_samps;
-        while (remaining > 0) {
-            size_t space_to_end = pre_trig_samples - pre_trig_write_idx;
-            size_t to_copy = std::min(remaining, space_to_end);
-            std::memcpy(&pre_trig_buffer[pre_trig_write_idx], src, to_copy * sizeof(samp_type));
-            src += to_copy;
-            remaining -= to_copy;
-            pre_trig_write_idx += to_copy;
-            if (pre_trig_write_idx >= pre_trig_samples) {
-                pre_trig_write_idx = 0;
-                pre_trig_full = true;
+            if (md.error_code != uhd::rx_metadata_t::ERROR_CODE_NONE) {
+                if (continue_on_bad_packet) continue;
+                else throw std::runtime_error(md.strerror());
             }
+
+            num_total_samps += num_rx_samps;
         }
 
-        active_buf_idx += num_rx_samps;
+        std::cout << "\nRecording complete. Total samples: " << num_total_samps << std::endl;
 
-        // Detection buffer full - swap and signal detection thread
-        if (active_buf_idx >= detect_samples) {
-            {
-                std::lock_guard<std::mutex> lock(buf_mutex);
-                std::swap(active_buf, process_buf);
-                process_count = detect_samples;
+        // Add OVF to filename if overflow occurred
+        if (had_overflow && !capture_file.empty()) {
+            size_t dot_pos = capture_file.rfind(".dat");
+            if (dot_pos != std::string::npos) {
+                capture_file.insert(dot_pos, "_OVF");
             }
-            buf_ready.notify_one();
-            active_buf_idx = 0;
-        }
-    }
-
-    // Stop detection thread
-    detection_thread_running = false;
-    buf_ready.notify_all();
-    detector.join();
-
-    // Print top power readings
-    print_top_powers();
-
-    if (!triggered) {
-        std::cout << "\nStopped without trigger." << std::endl;
-        stream_cmd.stream_mode = uhd::stream_cmd_t::STREAM_MODE_STOP_CONTINUOUS;
-        rx_stream->issue_stream_cmd(stream_cmd);
-        return;
-    }
-
-    // === POST-TRIGGER PHASE ===
-    // Retry logic at start of recording
-    bool had_overflow = false;
-    int start_attempts = 0;
-    std::string recording_start_time;
-    size_t num_total_samps = 0;
-
-    while (start_attempts < start_retries && !stop_signal_called) {
-        start_attempts++;
-        num_total_samps = 0;
-
-        size_t num_rx_samps = rx_stream->recv(
-            ram_buffer.data(), samps_per_buff, md, 3.0, false);
-
-        if (md.error_code == uhd::rx_metadata_t::ERROR_CODE_OVERFLOW) {
-            std::cout << "Overflow at recording start, retrying (" << start_attempts << "/" << start_retries << ")" << std::endl;
-            continue;
+            std::cout << "Warning: Overflow occurred, file renamed to: " << capture_file << std::endl;
         }
 
-        // Clean start - capture timestamp now
-        recording_start_time = get_timestamp_ms();
-        num_total_samps = num_rx_samps;
-        break;
-    }
+        // Write to file - stitch pre-trigger + recording buffers
+        if (!null) {
+            size_t pre_trig_count = pre_trig_full ? pre_trig_samples : pre_trig_write_idx;
+            size_t total_written = pre_trig_count + num_total_samps;
 
-    if (start_attempts >= start_retries && num_total_samps == 0) {
-        std::cerr << "Failed to start recording cleanly after " << start_retries << " attempts" << std::endl;
-        stream_cmd.stream_mode = uhd::stream_cmd_t::STREAM_MODE_STOP_CONTINUOUS;
-        rx_stream->issue_stream_cmd(stream_cmd);
-        return;
-    }
+            std::cout << "Writing to file: " << pre_trig_count << " pre-trigger + "
+                      << num_total_samps << " recorded = " << total_written << " samples" << std::endl;
 
-    // Generate filename if auto-filename mode (file is empty)
-    if (file.empty() && !null) {
-        file = generate_filename(output_dir, hostname, recording_start_time, freq,
-            usrp->get_rx_rate(channel), time_requested, gain, file_desc);
-        std::cout << "Output file: " << file << std::endl;
-    }
+            const auto write_start = std::chrono::steady_clock::now();
 
-    std::cout << "Recording..." << std::endl;
-
-    while (!stop_signal_called && num_total_samps < recording_samples) {
-        size_t remaining = recording_samples - num_total_samps;
-        size_t to_recv = std::min(samps_per_buff, remaining);
-
-        size_t num_rx_samps = rx_stream->recv(
-            &ram_buffer[num_total_samps],
-            to_recv,
-            md, 3.0, false);
-
-        if (md.error_code == uhd::rx_metadata_t::ERROR_CODE_TIMEOUT) break;
-        if (md.error_code == uhd::rx_metadata_t::ERROR_CODE_OVERFLOW) {
-            if (!had_overflow) {
-                had_overflow = true;
-                std::cerr << "Overflow during recording!" << std::endl;
+            std::ofstream outfile(capture_file.c_str(), std::ofstream::binary);
+            if (!outfile.is_open()) {
+                throw std::runtime_error("Failed to open output file");
             }
-            continue;
-        }
-        if (md.error_code != uhd::rx_metadata_t::ERROR_CODE_NONE) {
-            if (continue_on_bad_packet) continue;
-            else throw std::runtime_error(md.strerror());
+
+            // Write pre-trigger buffer (unwrap circular buffer)
+            if (pre_trig_full) {
+                // Buffer wrapped - write from write_idx to end, then start to write_idx
+                outfile.write(reinterpret_cast<const char*>(&pre_trig_buffer[pre_trig_write_idx]),
+                              (pre_trig_samples - pre_trig_write_idx) * sizeof(samp_type));
+                outfile.write(reinterpret_cast<const char*>(&pre_trig_buffer[0]),
+                              pre_trig_write_idx * sizeof(samp_type));
+            } else {
+                // Buffer not full - write from start to write_idx
+                outfile.write(reinterpret_cast<const char*>(&pre_trig_buffer[0]),
+                              pre_trig_write_idx * sizeof(samp_type));
+            }
+
+            // Write post-trigger recording
+            outfile.write(reinterpret_cast<const char*>(ram_buffer.data()),
+                          num_total_samps * sizeof(samp_type));
+            outfile.close();
+
+            const auto write_stop = std::chrono::steady_clock::now();
+            double write_duration = std::chrono::duration<double>(write_stop - write_start).count();
+            std::cout << "File write completed in " << write_duration << " seconds" << std::endl;
         }
 
-        num_total_samps += num_rx_samps;
+        if (stop_signal_called) break;
     }
 
-    // Stop streaming
+    // Stop streaming after all captures complete
     stream_cmd.stream_mode = uhd::stream_cmd_t::STREAM_MODE_STOP_CONTINUOUS;
     rx_stream->issue_stream_cmd(stream_cmd);
-
-    std::cout << "\nRecording complete. Total samples: " << num_total_samps << std::endl;
-
-    // Add OVF to filename if overflow occurred
-    if (had_overflow && !file.empty()) {
-        size_t dot_pos = file.rfind(".dat");
-        if (dot_pos != std::string::npos) {
-            file.insert(dot_pos, "_OVF");
-        }
-        std::cout << "Warning: Overflow occurred, file renamed to: " << file << std::endl;
-    }
-
-    // Write to file - stitch pre-trigger + recording buffers
-    if (!null) {
-        size_t pre_trig_count = pre_trig_full ? pre_trig_samples : pre_trig_write_idx;
-        size_t total_written = pre_trig_count + num_total_samps;
-
-        std::cout << "Writing to file: " << pre_trig_count << " pre-trigger + "
-                  << num_total_samps << " recorded = " << total_written << " samples" << std::endl;
-
-        const auto write_start = std::chrono::steady_clock::now();
-
-        std::ofstream outfile(file.c_str(), std::ofstream::binary);
-        if (!outfile.is_open()) {
-            throw std::runtime_error("Failed to open output file");
-        }
-
-        // Write pre-trigger buffer (unwrap circular buffer)
-        if (pre_trig_full) {
-            // Buffer wrapped - write from write_idx to end, then start to write_idx
-            outfile.write(reinterpret_cast<const char*>(&pre_trig_buffer[pre_trig_write_idx]),
-                          (pre_trig_samples - pre_trig_write_idx) * sizeof(samp_type));
-            outfile.write(reinterpret_cast<const char*>(&pre_trig_buffer[0]),
-                          pre_trig_write_idx * sizeof(samp_type));
-        } else {
-            // Buffer not full - write from start to write_idx
-            outfile.write(reinterpret_cast<const char*>(&pre_trig_buffer[0]),
-                          pre_trig_write_idx * sizeof(samp_type));
-        }
-
-        // Write post-trigger recording
-        outfile.write(reinterpret_cast<const char*>(ram_buffer.data()),
-                      num_total_samps * sizeof(samp_type));
-        outfile.close();
-
-        const auto write_stop = std::chrono::steady_clock::now();
-        double write_duration = std::chrono::duration<double>(write_stop - write_start).count();
-        std::cout << "File write completed in " << write_duration << " seconds" << std::endl;
-    }
 }
 
 // Immediate recording (no trigger) - record directly to RAM for duration
@@ -650,7 +682,7 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
     size_t channel, spb;
     double rate, freq, gain, bw, total_time, setup_time, lo_offset;
     double threshold, detect_dur, pre_trig_time;
-    int hyst, skip_first, start_retries;
+    int hyst, skip_first, start_retries, capture_count;
 
     // Setup program options
     po::options_description desc("Allowed options");
@@ -687,6 +719,8 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
         ("start-retries", po::value<int>(&start_retries)->default_value(3), "max retries at start on overflow")
         // Wait mode
         ("wait", "wait for Enter key before recording (non-trigger mode only)")
+        // Multi-capture
+        ("count", po::value<int>(&capture_count)->default_value(1), "number of trigger captures (1-16, 0=infinite)")
     ;
 
     po::variables_map vm;
@@ -708,6 +742,12 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
     // Validate auto-filename requirements
     if (auto_filename && !vm.count("desc")) {
         std::cerr << "Error: --desc required when --file not specified" << std::endl;
+        return ~0;
+    }
+
+    // Validate capture count (0=infinite, 1-16 valid)
+    if (capture_count < 0 || capture_count > 16) {
+        std::cerr << "Error: --count must be 0 (infinite) or 1-16" << std::endl;
         return ~0;
     }
 
@@ -795,15 +835,15 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
         if (type == "double")
             recv_to_file_triggered<std::complex<double>>(usrp, "fc64", wirefmt, channel, output_file, spb,
                 total_time, threshold, hyst, detect_dur, pre_trig_time, null, continue_on_bad_packet,
-                output_dir, hostname, freq, gain_val, file_desc, skip_first, start_retries);
+                output_dir, hostname, freq, gain_val, file_desc, skip_first, start_retries, capture_count);
         else if (type == "float")
             recv_to_file_triggered<std::complex<float>>(usrp, "fc32", wirefmt, channel, output_file, spb,
                 total_time, threshold, hyst, detect_dur, pre_trig_time, null, continue_on_bad_packet,
-                output_dir, hostname, freq, gain_val, file_desc, skip_first, start_retries);
+                output_dir, hostname, freq, gain_val, file_desc, skip_first, start_retries, capture_count);
         else if (type == "short")
             recv_to_file_triggered<std::complex<short>>(usrp, "sc16", wirefmt, channel, output_file, spb,
                 total_time, threshold, hyst, detect_dur, pre_trig_time, null, continue_on_bad_packet,
-                output_dir, hostname, freq, gain_val, file_desc, skip_first, start_retries);
+                output_dir, hostname, freq, gain_val, file_desc, skip_first, start_retries, capture_count);
         else
             throw std::runtime_error("Unknown type " + type);
     } else {
