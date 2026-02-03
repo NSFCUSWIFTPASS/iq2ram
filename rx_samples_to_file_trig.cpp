@@ -179,7 +179,8 @@ void recv_to_file_triggered(
     const std::string& file_desc,
     int skip_first,
     int start_retries,
-    int capture_count)
+    int capture_count,
+    double dead_time)
 {
     // Create receive streamer
     uhd::stream_args_t stream_args(cpu_format, wire_format);
@@ -454,6 +455,19 @@ void recv_to_file_triggered(
         }
 
         if (stop_signal_called) break;
+
+        // Dead time - discard samples before next capture
+        if (dead_time > 0 && capture_num < total_captures) {
+            size_t dead_samples = static_cast<size_t>(dead_time * sample_rate);
+            size_t discarded = 0;
+            std::cout << "Dead time: discarding " << dead_time << "s of samples..." << std::endl;
+            while (discarded < dead_samples && !stop_signal_called) {
+                size_t to_discard = std::min(samps_per_buff, dead_samples - discarded);
+                size_t num_rx = rx_stream->recv(temp_buf.data(), to_discard, md, 3.0, false);
+                if (md.error_code == uhd::rx_metadata_t::ERROR_CODE_TIMEOUT) break;
+                discarded += num_rx;
+            }
+        }
     }
 
     // Stop streaming after all captures complete
@@ -681,7 +695,7 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
     std::string args, file, type, ant, subdev, ref, wirefmt, file_desc, output_dir;
     size_t channel, spb;
     double rate, freq, gain, bw, total_time, setup_time, lo_offset;
-    double threshold, detect_dur, pre_trig_time;
+    double threshold, detect_dur, pre_trig_time, dead_time;
     int hyst, skip_first, start_retries, capture_count;
 
     // Setup program options
@@ -721,6 +735,7 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
         ("wait", "wait for Enter key before recording (non-trigger mode only)")
         // Multi-capture
         ("count", po::value<int>(&capture_count)->default_value(1), "number of trigger captures (1-16, 0=infinite)")
+        ("dead-time", po::value<double>(&dead_time)->default_value(60.0), "dead time between captures in seconds")
     ;
 
     po::variables_map vm;
@@ -835,15 +850,15 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
         if (type == "double")
             recv_to_file_triggered<std::complex<double>>(usrp, "fc64", wirefmt, channel, output_file, spb,
                 total_time, threshold, hyst, detect_dur, pre_trig_time, null, continue_on_bad_packet,
-                output_dir, hostname, freq, gain_val, file_desc, skip_first, start_retries, capture_count);
+                output_dir, hostname, freq, gain_val, file_desc, skip_first, start_retries, capture_count, dead_time);
         else if (type == "float")
             recv_to_file_triggered<std::complex<float>>(usrp, "fc32", wirefmt, channel, output_file, spb,
                 total_time, threshold, hyst, detect_dur, pre_trig_time, null, continue_on_bad_packet,
-                output_dir, hostname, freq, gain_val, file_desc, skip_first, start_retries, capture_count);
+                output_dir, hostname, freq, gain_val, file_desc, skip_first, start_retries, capture_count, dead_time);
         else if (type == "short")
             recv_to_file_triggered<std::complex<short>>(usrp, "sc16", wirefmt, channel, output_file, spb,
                 total_time, threshold, hyst, detect_dur, pre_trig_time, null, continue_on_bad_packet,
-                output_dir, hostname, freq, gain_val, file_desc, skip_first, start_retries, capture_count);
+                output_dir, hostname, freq, gain_val, file_desc, skip_first, start_retries, capture_count, dead_time);
         else
             throw std::runtime_error("Unknown type " + type);
     } else {
