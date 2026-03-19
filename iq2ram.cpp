@@ -60,6 +60,7 @@ static std::atomic<bool> enter_pressed{false};
 static std::mutex buf_mutex;
 static std::condition_variable buf_ready;
 static std::atomic<bool> detection_thread_running{true};
+static std::atomic<bool> detection_idle{true};
 
 void sig_int_handler(int)
 {
@@ -121,32 +122,42 @@ void print_top_powers() {
 // Detection thread function
 template <typename samp_type>
 void detection_thread_fn(
-    std::vector<samp_type>* process_buf,
+    std::vector<samp_type>** process_buf_ptr,
     size_t* process_count,
     double threshold,
     int hyst)
 {
     while (detection_thread_running && !triggered) {
-        std::unique_lock<std::mutex> lock(buf_mutex);
-        buf_ready.wait(lock, [&]{
-            return !detection_thread_running || triggered || *process_count > 0;
-        });
+        // Hold lock only long enough to grab buffer pointer and count
+        const samp_type* data = nullptr;
+        size_t count = 0;
+        {
+            std::unique_lock<std::mutex> lock(buf_mutex);
+            buf_ready.wait(lock, [&]{
+                return !detection_thread_running || triggered || *process_count > 0;
+            });
 
-        if (!detection_thread_running || triggered) break;
-        if (*process_count == 0) continue;
+            if (!detection_thread_running || triggered) break;
+            if (*process_count == 0) continue;
 
-        // Compute mean power in dB
-        double avg_db = compute_mean_power_db(process_buf->data(), *process_count);
-        *process_count = 0;  // Mark as processed
+            data = (*process_buf_ptr)->data();
+            count = *process_count;
+            *process_count = 0;
+            detection_idle = false;  // Signal: thread is reading this buffer
+        }
+
+        // Compute power and print WITHOUT holding the mutex.
+        // Main thread will not swap into this buffer while detection_idle is false.
+        double avg_db = compute_mean_power_db(data, count);
 
         // Track top powers
         update_top_powers(avg_db);
 
         // Threshold check with hysteresis
         if (avg_db > threshold) {
-            int count = ++detection_count;
-            std::cout << "\ravg=" << avg_db << " dB [" << count << "/" << hyst << "] ABOVE    " << std::flush;
-            if (count >= hyst) {
+            int c = ++detection_count;
+            std::cout << "\ravg=" << avg_db << " dB [" << c << "/" << hyst << "] ABOVE    " << std::flush;
+            if (c >= hyst) {
                 triggered = true;
                 std::cout << "\nTRIGGERED!" << std::endl;
             }
@@ -154,6 +165,8 @@ void detection_thread_fn(
             detection_count = 0;
             std::cout << "\ravg=" << avg_db << " dB [0/" << hyst << "]         " << std::flush;
         }
+
+        detection_idle = true;  // Done reading buffer, safe to swap
     }
 }
 
@@ -222,10 +235,6 @@ void recv_to_file_triggered(
     ram_buffer.resize(recording_samples);
     std::cout << "RAM buffer allocated." << std::endl;
 
-    // Start detection thread
-    std::thread detector(detection_thread_fn<samp_type>,
-                        process_buf, &process_count, threshold, hyst);
-
     // Temp buffer for skip/warmup
     std::vector<samp_type> temp_buf(samps_per_buff);
 
@@ -249,6 +258,7 @@ void recv_to_file_triggered(
         triggered = false;
         detection_count = 0;
         detection_thread_running = true;
+        detection_idle = true;
         top_powers.clear();
 
         // Reset pre-trigger buffer state
@@ -270,7 +280,7 @@ void recv_to_file_triggered(
 
         // Start detection thread for this capture
         std::thread detector(detection_thread_fn<samp_type>,
-                            process_buf, &process_count, threshold, hyst);
+                            &process_buf, &process_count, threshold, hyst);
 
         bool overflow_message = true;
 
@@ -319,8 +329,13 @@ void recv_to_file_triggered(
             if (active_buf_idx >= detect_samples) {
                 {
                     std::lock_guard<std::mutex> lock(buf_mutex);
-                    std::swap(active_buf, process_buf);
-                    process_count = detect_samples;
+                    if (process_count == 0 && detection_idle) {
+                        // Detection thread finished with previous buffer, safe to swap
+                        std::swap(active_buf, process_buf);
+                        process_count = detect_samples;
+                    }
+                    // else: detection still processing, skip this window to avoid
+                    // writing into the buffer the detection thread is reading
                 }
                 buf_ready.notify_one();
                 active_buf_idx = 0;
