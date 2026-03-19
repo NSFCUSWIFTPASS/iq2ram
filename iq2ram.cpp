@@ -342,21 +342,21 @@ void recv_to_file_triggered(
             }
         }
 
-        // Stop detection thread
+        // Signal detection thread to stop (it will exit on its own since
+        // triggered=true, but set the flag so it doesn't block in wait())
         detection_thread_running = false;
         buf_ready.notify_all();
-        detector.join();
-
-        // Print top power readings
-        print_top_powers();
 
         if (!triggered) {
+            detector.join();
+            print_top_powers();
             std::cout << "\nStopped without trigger." << std::endl;
             break;  // Exit capture loop
         }
 
         // === POST-TRIGGER PHASE ===
-        // Retry logic at start of recording
+        // Start recording immediately -- don't wait for detection thread
+        // join or print, which would leave recv() uncalled and overflow.
         bool had_overflow = false;
         int start_attempts = 0;
         std::string recording_start_time;
@@ -379,6 +379,10 @@ void recv_to_file_triggered(
             num_total_samps = num_rx_samps;
             break;
         }
+
+        // Now safe to join detection thread and print (recv() is running)
+        detector.join();
+        print_top_powers();
 
         if (start_attempts >= start_retries && num_total_samps == 0) {
             std::cerr << "Failed to start recording cleanly after " << start_retries << " attempts" << std::endl;
