@@ -195,6 +195,8 @@ void recv_to_file_triggered(
     int capture_count,
     double dead_time)
 {
+    uhd::set_thread_priority_safe();
+
     // Create receive streamer
     uhd::stream_args_t stream_args(cpu_format, wire_format);
     std::vector<size_t> channel_nums;
@@ -355,8 +357,13 @@ void recv_to_file_triggered(
         }
 
         // === POST-TRIGGER PHASE ===
-        // Start recording immediately -- don't wait for detection thread
-        // join or print, which would leave recv() uncalled and overflow.
+        // CRITICAL PATH: keep the gap between the first recv() after trigger and
+        // the main recording loop as tight as possible. Any work in that gap is
+        // time during which recv() is not called and the UHD host buffer fills.
+        // At high sample rates even a single synchronous cout flush (e.g. over
+        // SSH) can exceed the buffer and overflow the next recv(). All
+        // reporting/joining/filename generation is deferred to AFTER the main
+        // recording loop completes.
         bool had_overflow = false;
         int start_attempts = 0;
         std::string recording_start_time;
@@ -370,8 +377,7 @@ void recv_to_file_triggered(
                 ram_buffer.data(), samps_per_buff, md, 3.0, false);
 
             if (md.error_code == uhd::rx_metadata_t::ERROR_CODE_OVERFLOW) {
-                std::cout << "Overflow at recording start, retrying (" << start_attempts << "/" << start_retries << ")" << std::endl;
-                continue;
+                continue;  // silent retry to keep critical path tight
             }
 
             // Clean start - capture timestamp now
@@ -380,25 +386,14 @@ void recv_to_file_triggered(
             break;
         }
 
-        // Now safe to join detection thread and print (recv() is running)
-        detector.join();
-        print_top_powers();
-
         if (start_attempts >= start_retries && num_total_samps == 0) {
+            detector.join();
+            print_top_powers();
             std::cerr << "Failed to start recording cleanly after " << start_retries << " attempts" << std::endl;
             break;  // Exit capture loop
         }
 
-        // Generate filename for this capture (always auto-generate in multi-capture mode)
-        std::string capture_file = file;
-        if (capture_file.empty() && !null) {
-            capture_file = generate_filename(output_dir, hostname, recording_start_time, freq,
-                usrp->get_rx_rate(channel), time_requested, gain, file_desc);
-            std::cout << "Output file: " << capture_file << std::endl;
-        }
-
-        std::cout << "Recording..." << std::endl;
-
+        // Enter the main recording loop IMMEDIATELY -- no cout in between.
         while (!stop_signal_called && num_total_samps < recording_samples) {
             size_t remaining = recording_samples - num_total_samps;
             size_t to_recv = std::min(samps_per_buff, remaining);
@@ -424,7 +419,23 @@ void recv_to_file_triggered(
             num_total_samps += num_rx_samps;
         }
 
+        // Recording done -- safe to do all the deferred reporting now.
+        detector.join();
+        print_top_powers();
+
+        if (start_attempts > 1) {
+            std::cout << "Started after " << start_attempts << " retries at recording start" << std::endl;
+        }
+
         std::cout << "\nRecording complete. Total samples: " << num_total_samps << std::endl;
+
+        // Generate filename for this capture (always auto-generate in multi-capture mode)
+        std::string capture_file = file;
+        if (capture_file.empty() && !null) {
+            capture_file = generate_filename(output_dir, hostname, recording_start_time, freq,
+                usrp->get_rx_rate(channel), time_requested, gain, file_desc);
+            std::cout << "Output file: " << capture_file << std::endl;
+        }
 
         // Add OVF to filename if overflow occurred
         if (had_overflow && !capture_file.empty()) {
@@ -515,6 +526,8 @@ void recv_to_file_immediate(
     int start_retries,
     bool wait_mode)
 {
+    uhd::set_thread_priority_safe();
+
     // Create receive streamer
     uhd::stream_args_t stream_args(cpu_format, wire_format);
     std::vector<size_t> channel_nums;
@@ -566,7 +579,12 @@ void recv_to_file_immediate(
         }
     }
 
-    // Retry logic at start
+    // Retry logic at start.
+    // CRITICAL PATH: keep the gap between the first successful recv() and the
+    // main recording loop tight. Any cout (especially over slow stdout like SSH)
+    // is time during which the USB host buffer fills, and at high sample rates
+    // that gap can exceed the buffer and overflow the next recv(). Reporting
+    // and filename generation are deferred until after recording completes.
     bool had_overflow = false;
     int start_attempts = 0;
     std::string recording_start_time;
@@ -580,8 +598,7 @@ void recv_to_file_immediate(
             ram_buffer.data(), samps_per_buff, md, 3.0, false);
 
         if (md.error_code == uhd::rx_metadata_t::ERROR_CODE_OVERFLOW) {
-            std::cout << "Overflow at start, retrying (" << start_attempts << "/" << start_retries << ")" << std::endl;
-            continue;
+            continue;  // silent retry to keep critical path tight
         }
 
         // Clean start - capture timestamp now
@@ -597,15 +614,7 @@ void recv_to_file_immediate(
         return;
     }
 
-    // Generate filename if auto-filename mode (file is empty)
-    if (file.empty() && !null) {
-        file = generate_filename(output_dir, hostname, recording_start_time, freq,
-            sample_rate, time_requested, gain, file_desc);
-        std::cout << "Output file: " << file << std::endl;
-    }
-
-    std::cout << "Recording for " << time_requested << " seconds..." << std::endl;
-
+    // Enter the main recording loop IMMEDIATELY -- no cout in between.
     while (!stop_signal_called && num_total_samps < recording_samples) {
         size_t remaining = recording_samples - num_total_samps;
         size_t to_recv = std::min(samps_per_buff, remaining);
@@ -635,7 +644,18 @@ void recv_to_file_immediate(
     stream_cmd.stream_mode = uhd::stream_cmd_t::STREAM_MODE_STOP_CONTINUOUS;
     rx_stream->issue_stream_cmd(stream_cmd);
 
+    if (start_attempts > 1) {
+        std::cout << "Started after " << start_attempts << " retries" << std::endl;
+    }
+
     std::cout << "\nRecording complete. Total samples: " << num_total_samps << std::endl;
+
+    // Generate filename if auto-filename mode (file is empty)
+    if (file.empty() && !null) {
+        file = generate_filename(output_dir, hostname, recording_start_time, freq,
+            sample_rate, time_requested, gain, file_desc);
+        std::cout << "Output file: " << file << std::endl;
+    }
 
     // Add OVF to filename if overflow occurred
     if (had_overflow && !file.empty()) {
