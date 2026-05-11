@@ -193,7 +193,8 @@ void recv_to_file_triggered(
     int skip_first,
     int start_retries,
     int capture_count,
-    double dead_time)
+    double dead_time,
+    double warmup_dur)
 {
     uhd::set_thread_priority_safe();
 
@@ -248,6 +249,23 @@ void recv_to_file_triggered(
     // Skip first recv() calls (warm-up)
     for (int i = 0; i < skip_first; i++) {
         rx_stream->recv(temp_buf.data(), samps_per_buff, md, 3.0, false);
+    }
+
+    // Time-based warmup drain: let USB transport and FPGA streaming
+    // stabilize before recording starts. The skip_first count above is
+    // sample-rate-dependent (each call is samps_per_buff/rate seconds),
+    // which gives only ~4 ms of warmup at 26 Msps -- not enough at high
+    // rates. This drain is time-based and consistent across rates.
+    // Overflows during warmup are expected and ignored.
+    if (warmup_dur > 0) {
+        size_t warmup_samples = static_cast<size_t>(warmup_dur * sample_rate);
+        size_t warmup_drained = 0;
+        while (warmup_drained < warmup_samples && !stop_signal_called) {
+            size_t to_drain = std::min(samps_per_buff, warmup_samples - warmup_drained);
+            size_t num_rx = rx_stream->recv(temp_buf.data(), to_drain, md, 3.0, false);
+            if (md.error_code == uhd::rx_metadata_t::ERROR_CODE_TIMEOUT) break;
+            warmup_drained += num_rx;
+        }
     }
 
     // Determine if infinite mode (count=0)
@@ -524,7 +542,8 @@ void recv_to_file_immediate(
     const std::string& file_desc,
     int skip_first,
     int start_retries,
-    bool wait_mode)
+    bool wait_mode,
+    double warmup_dur)
 {
     uhd::set_thread_priority_safe();
 
@@ -557,6 +576,21 @@ void recv_to_file_immediate(
     // Skip first recv() calls (warm-up)
     for (int i = 0; i < skip_first; i++) {
         rx_stream->recv(temp_buf.data(), samps_per_buff, md, 3.0, false);
+    }
+
+    // Time-based warmup drain: let USB transport and FPGA streaming
+    // stabilize before recording starts. Especially important in
+    // immediate mode where there's no detection phase to act as
+    // natural warmup. Overflows during warmup are expected and ignored.
+    if (warmup_dur > 0 && !wait_mode) {
+        size_t warmup_samples = static_cast<size_t>(warmup_dur * sample_rate);
+        size_t warmup_drained = 0;
+        while (warmup_drained < warmup_samples && !stop_signal_called) {
+            size_t to_drain = std::min(samps_per_buff, warmup_samples - warmup_drained);
+            size_t num_rx = rx_stream->recv(temp_buf.data(), to_drain, md, 3.0, false);
+            if (md.error_code == uhd::rx_metadata_t::ERROR_CODE_TIMEOUT) break;
+            warmup_drained += num_rx;
+        }
     }
 
     // Wait mode - discard samples until Enter is pressed
@@ -734,7 +768,7 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
     std::string args, file, type, ant, subdev, ref, wirefmt, file_desc, output_dir;
     size_t channel, spb;
     double rate, freq, gain, bw, total_time, setup_time, lo_offset;
-    double threshold, detect_dur, pre_trig_time, dead_time;
+    double threshold, detect_dur, pre_trig_time, dead_time, warmup_dur;
     int hyst, skip_first, start_retries, capture_count;
 
     // Setup program options
@@ -769,6 +803,7 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
         ("pre-trig", po::value<double>(&pre_trig_time)->default_value(1.0), "pre-trigger buffer (seconds)")
         // Overflow handling
         ("skip-first", po::value<int>(&skip_first)->default_value(1), "skip first N recv() calls (warm-up)")
+        ("warmup", po::value<double>(&warmup_dur)->default_value(0.5), "time-based warmup drain duration in seconds (lets USB/FPGA stabilize before recording; set 0 to disable)")
         ("start-retries", po::value<int>(&start_retries)->default_value(3), "max retries at start on overflow")
         // Wait mode
         ("wait", "wait for Enter key before recording (non-trigger mode only)")
@@ -812,10 +847,24 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
     }
     double gain_val = vm.count("gain") ? gain : 0.0;
 
+    // Augment device args with sensible transport defaults if user didn't
+    // specify them. Larger num_recv_frames means a bigger USB host-side ring
+    // buffer, which gives more tolerance for scheduling jitter and reduces
+    // the chance of overflow at high sample rates. User-supplied values
+    // always win.
+    std::string device_args = args;
+    auto has_arg = [&device_args](const std::string& key) {
+        return device_args.find(key + "=") != std::string::npos;
+    };
+    if (!has_arg("num_recv_frames")) {
+        if (!device_args.empty()) device_args += ",";
+        device_args += "num_recv_frames=128";
+    }
+
     // Create USRP device
     std::cout << std::endl;
-    std::cout << boost::format("Creating the usrp device with: %s...") % args << std::endl;
-    uhd::usrp::multi_usrp::sptr usrp = uhd::usrp::multi_usrp::make(args);
+    std::cout << boost::format("Creating the usrp device with: %s...") % device_args << std::endl;
+    uhd::usrp::multi_usrp::sptr usrp = uhd::usrp::multi_usrp::make(device_args);
 
     // Lock mboard clocks
     if (vm.count("ref")) {
@@ -889,15 +938,15 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
         if (type == "double")
             recv_to_file_triggered<std::complex<double>>(usrp, "fc64", wirefmt, channel, output_file, spb,
                 total_time, threshold, hyst, detect_dur, pre_trig_time, null, continue_on_bad_packet,
-                output_dir, hostname, freq, gain_val, file_desc, skip_first, start_retries, capture_count, dead_time);
+                output_dir, hostname, freq, gain_val, file_desc, skip_first, start_retries, capture_count, dead_time, warmup_dur);
         else if (type == "float")
             recv_to_file_triggered<std::complex<float>>(usrp, "fc32", wirefmt, channel, output_file, spb,
                 total_time, threshold, hyst, detect_dur, pre_trig_time, null, continue_on_bad_packet,
-                output_dir, hostname, freq, gain_val, file_desc, skip_first, start_retries, capture_count, dead_time);
+                output_dir, hostname, freq, gain_val, file_desc, skip_first, start_retries, capture_count, dead_time, warmup_dur);
         else if (type == "short")
             recv_to_file_triggered<std::complex<short>>(usrp, "sc16", wirefmt, channel, output_file, spb,
                 total_time, threshold, hyst, detect_dur, pre_trig_time, null, continue_on_bad_packet,
-                output_dir, hostname, freq, gain_val, file_desc, skip_first, start_retries, capture_count, dead_time);
+                output_dir, hostname, freq, gain_val, file_desc, skip_first, start_retries, capture_count, dead_time, warmup_dur);
         else
             throw std::runtime_error("Unknown type " + type);
     } else {
@@ -905,15 +954,15 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
         if (type == "double")
             recv_to_file_immediate<std::complex<double>>(usrp, "fc64", wirefmt, channel, output_file, spb,
                 total_time, null, continue_on_bad_packet,
-                output_dir, hostname, freq, gain_val, file_desc, skip_first, start_retries, wait_mode);
+                output_dir, hostname, freq, gain_val, file_desc, skip_first, start_retries, wait_mode, warmup_dur);
         else if (type == "float")
             recv_to_file_immediate<std::complex<float>>(usrp, "fc32", wirefmt, channel, output_file, spb,
                 total_time, null, continue_on_bad_packet,
-                output_dir, hostname, freq, gain_val, file_desc, skip_first, start_retries, wait_mode);
+                output_dir, hostname, freq, gain_val, file_desc, skip_first, start_retries, wait_mode, warmup_dur);
         else if (type == "short")
             recv_to_file_immediate<std::complex<short>>(usrp, "sc16", wirefmt, channel, output_file, spb,
                 total_time, null, continue_on_bad_packet,
-                output_dir, hostname, freq, gain_val, file_desc, skip_first, start_retries, wait_mode);
+                output_dir, hostname, freq, gain_val, file_desc, skip_first, start_retries, wait_mode, warmup_dur);
         else
             throw std::runtime_error("Unknown type " + type);
     }
