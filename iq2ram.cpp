@@ -27,8 +27,27 @@
 #include <cmath>
 #include <cstring>
 #include <unistd.h>
+#include <sys/stat.h>
+#include <cerrno>
 
 namespace po = boost::program_options;
+
+// Verify file size on disk matches expected bytes; throws on mismatch or stat
+// failure. Catches silent short-write failures from ENOSPC etc., where the
+// stream layer reports success but the OS could not flush the data.
+static void verify_file_complete(const std::string& path, uint64_t expected_bytes) {
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0) {
+        throw std::runtime_error(
+            "Failed to stat output file '" + path + "': " + std::strerror(errno));
+    }
+    if (static_cast<uint64_t>(st.st_size) != expected_bytes) {
+        throw std::runtime_error(
+            "Short write to '" + path + "': got " + std::to_string(st.st_size)
+            + " bytes, expected " + std::to_string(expected_bytes)
+            + " (likely disk full)");
+    }
+}
 
 // Generate RFC3339 timestamp with milliseconds
 std::string get_timestamp_ms() {
@@ -495,7 +514,18 @@ void recv_to_file_triggered(
             // Write post-trigger recording
             outfile.write(reinterpret_cast<const char*>(ram_buffer.data()),
                           num_total_samps * sizeof(samp_type));
+            outfile.flush();
+            if (!outfile.good()) {
+                throw std::runtime_error(
+                    "Write error to '" + capture_file + "' (likely disk full)");
+            }
             outfile.close();
+            if (outfile.fail()) {
+                throw std::runtime_error(
+                    "Close error on '" + capture_file + "' (likely disk full)");
+            }
+
+            verify_file_complete(capture_file, total_written * sizeof(samp_type));
 
             const auto write_stop = std::chrono::steady_clock::now();
             double write_duration = std::chrono::duration<double>(write_stop - write_start).count();
@@ -711,7 +741,18 @@ void recv_to_file_immediate(
         }
         outfile.write(reinterpret_cast<const char*>(ram_buffer.data()),
                       num_total_samps * sizeof(samp_type));
+        outfile.flush();
+        if (!outfile.good()) {
+            throw std::runtime_error(
+                "Write error to '" + file + "' (likely disk full)");
+        }
         outfile.close();
+        if (outfile.fail()) {
+            throw std::runtime_error(
+                "Close error on '" + file + "' (likely disk full)");
+        }
+
+        verify_file_complete(file, num_total_samps * sizeof(samp_type));
 
         const auto write_stop = std::chrono::steady_clock::now();
         double write_duration = std::chrono::duration<double>(write_stop - write_start).count();
