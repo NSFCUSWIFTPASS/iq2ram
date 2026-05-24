@@ -952,6 +952,10 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
     if (vm.count("ant"))
         usrp->set_rx_antenna(ant, channel);
 
+    // Enable automatic DC offset correction (mitigates LO leakage center bin)
+    usrp->set_rx_dc_offset(true, channel);
+    std::cout << "Enabled automatic RX DC offset correction" << std::endl;
+
     std::this_thread::sleep_for(std::chrono::milliseconds(int64_t(1000 * setup_time)));
 
     // Check LO lock
